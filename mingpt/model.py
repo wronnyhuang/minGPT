@@ -49,18 +49,30 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-    def forward(self, x):
+    def forward(self, x, past_kv=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        # Apply KV caching if used
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat((past_k, k), dim=2)
+            v = torch.cat((past_v, v), dim=2)
+        
+        # Save current keys and values
+        present_kv = (k, v)
+
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # Apply causal mask - shape adapted to handle the case of kv cache
+        T_q, T_k = q.size(2), k.size(2)
+        # print(self.bias[:, :, (T_k-T_q):T_k, :T_k])
+        att = att.masked_fill(self.bias[:, :, (T_k-T_q):T_k, :T_k] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -68,7 +80,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, present_kv
 
 class Block(nn.Module):
     """ an unassuming Transformer block """
@@ -87,10 +99,11 @@ class Block(nn.Module):
         m = self.mlp
         self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, past_kv=None):
+        attn_output, present_kv = self.attn(self.ln_1(x), past_kv=past_kv)
+        x = x + attn_output
         x = x + self.mlpf(self.ln_2(x))
-        return x
+        return x, present_kv
 
 class GPT(nn.Module):
     """ GPT Language Model """
@@ -257,18 +270,35 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, past_key_values=None, use_cache=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+        
+        # Handle positions with KV cache
+        if past_key_values is not None:
+            # With past_key_values, we only need positions for new tokens
+            past_length = past_key_values[0][0].size(2)  # Get length from first layer's K cache
+            pos = torch.arange(past_length, past_length + t, dtype=torch.long, device=device).unsqueeze(0)
+        else:
+            # No cache, need all positions
+            pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+        
+        # Initialize present_key_values if caching
+        present_key_values = [] if use_cache else None
+        
+        # Process through transformer blocks
+        for i, block in enumerate(self.transformer.h):
+            past_kv_i = None if past_key_values is None else past_key_values[i]
+            x, present_kv_i = block(x, past_kv=past_kv_i)
+            if use_cache:
+                present_key_values.append(present_kv_i)
+        
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
 
@@ -277,7 +307,10 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
-        return logits, loss
+        if use_cache:
+            return logits, loss, present_key_values
+        else:
+            return logits, loss
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
@@ -305,6 +338,49 @@ class GPT(nn.Module):
             else:
                 _, idx_next = torch.topk(probs, k=1, dim=-1)
             # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+            idx = torch.cat((idx, idx_next), dim=-1)
 
         return idx
+
+
+    @torch.no_grad()
+    def generate_kv(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Uses KV caching for efficiency.
+        """
+
+        # Get the initial sequence
+        full_idx = idx.clone()
+        
+        # Process the conditioning sequence to populate the KV cache
+        _, _, past_key_values = self(idx[:, :-1], use_cache=True)
+        
+        # Start with just the last token for subsequent iterations
+        next_token = idx[:, [-1]]
+
+        for _ in range(max_new_tokens):
+            # Forward pass with caching
+            logits, _, past_key_values = self(next_token, past_key_values=past_key_values, use_cache=True)
+            
+            # Get logits for the last token and apply temperature
+            logits = logits[:, -1, :] / temperature
+            
+            # Apply top-k filtering if specified
+            if top_k is not None:
+                v, _ = torch.topk(logits, top_k)
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # either sample from the distribution or take the most likely element
+            if do_sample:
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                _, next_token = torch.topk(probs, k=1, dim=-1)
+                
+            # Add to the sequence
+            full_idx = torch.cat((full_idx, next_token), dim=-1)
+            
+        return full_idx
+
