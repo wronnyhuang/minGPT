@@ -21,7 +21,18 @@ class LayerNormFun(torch.autograd.Function):
   def backward(ctx, grad_output):
     normalized, std, weight = ctx.saved_tensors
     grad_normalized = grad_output * weight
-    grad_input = 1 / std * (grad_normalized - grad_normalized.mean(dim=-1, keepdim=True) - normalized * (grad_normalized * normalized).mean(dim=-1, keepdim=True))
+    # Calculate the mean of grad_normalized
+    grad_norm_mean = grad_normalized.mean(dim=-1, keepdim=True)
+    
+    # Calculate the mean of (grad_normalized * normalized)
+    weighted_mean = (grad_normalized * normalized).mean(dim=-1, keepdim=True)
+    
+    # Combine the terms
+    grad_input = (1 / std) * (
+        grad_normalized - 
+        grad_norm_mean - 
+        normalized * weighted_mean
+    )
     sum_dims = tuple(range(grad_output.dim() - 1))
     grad_weight = (grad_output * normalized).sum(dim=sum_dims)
     grad_bias = grad_output.sum(dim=sum_dims)

@@ -1,0 +1,54 @@
+
+i have an interview coming as described below
+
+ML Debugging, 60 mins: 
+This interview will be a machine learning, debugging exercise. You'll be given a short implementation of a ML transformer model (using Python and PyTorch) and be tasked to find and fix all bugs in order for the model to work successfully. This exercise tests your knowledge of ML architectures and algorithms, your ability to trace bugs back to their source, and your level of attention to detail.
+
+
+please come up with a working ml debugging setup for me. give a short implementation of a ML transformer model (using Python and PyTorch).
+
+please include sinusoidal position embeddings
+
+please include bugs that involve disabling gradients
+
+please include bugs that involve initialization
+
+please include bugs that involve backprop
+
+please include bugs that involve tensor shape mismatch
+
+please include some tensor sharding in the implementation but do not use any fancy libraries. include explicitly the backprop function for the tensors you're sharding
+
+the final transformer implementation must have the following methods
+
+def __init__(self, num_layers, num_heads, ffn_dim, dim, vocab_size, block_size):
+  ... code here...
+
+idx: [batch_size, seq_len, dim]
+targets: [batch_size, seq_len]
+def forward(self, idx, targets=None):
+  """
+  idx: [batch_size, seq_len]
+  targets: [batch_size, seq_len]
+  returns
+    logits: [batch_size, seq_len, vocab_size]
+    loss: scalar    
+  ... code here ...
+  return logits, loss
+
+def generate(self, idx, max_new_tokens):
+  """runs inference.
+  idx: [batch_size, seq_len]
+  max_new_tokens: integer
+  returns
+    idx: [batch_size, seq_len+max_new_tokens]
+  """
+  ... code here ...
+  return idx
+
+you should generate three new files:
+1. a bug-free version without any comments
+2. a buggy version based on the same code as the bug-free version above, but with many subtle bugs that only a careful, skilled ml researcher would be able to spot. write comments in the code where the bugs are describing the bug
+3. the buggy version but with the comments describing the bugs removed
+
+put the new files in a new folder called buggy_transformer_5
